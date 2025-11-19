@@ -52,7 +52,9 @@ typedef struct {
     Command **commands;
     int num_commands;
     int is_conditional;  // 0=none, 1=and, 2=or
+    int has_syntax_error; // 0=no error, 1=syntax error on this line
 } Job;
+
 
 Command* command_create() {
     Command *cmd = malloc(sizeof(Command));
@@ -74,8 +76,10 @@ Job* job_create() {
     job->commands = malloc(sizeof(Command*) * MAX_TOKENS);
     job->num_commands = 0;
     job->is_conditional = 0;
+    job->has_syntax_error = 0;
     return job;
 }
+
 
 void job_free(Job *job) {
     for (int i = 0; i < job->num_commands; i++) {
@@ -170,6 +174,12 @@ int execute_builtin(Command *cmd, int *should_exit) {
 int execute_job(Job *job, int last_status, int is_batch, int *should_exit) {
     if (job->num_commands == 0) {
         return last_status;
+    }
+
+
+    if (job->has_syntax_error) {
+        // A command with a syntax error fails but the shell continues.
+        return 1;
     }
     
     // Handle conditionals
@@ -394,59 +404,92 @@ Job* parse_line(char *line) {
     job->commands[job->num_commands++] = current_cmd;
     
     char *ptr = line;
-    int in_redirect = 0;  // 0=none, 1=input, 2=output
+    int in_redirect = 0;  // 0 = none, 1 = input, 2 = output
     int first_token = 1;
     
     while (*ptr) {
         // Skip whitespace
-        while (*ptr == ' ' || *ptr == '\t') ptr++;
+        while (*ptr == ' ' || *ptr == '\t') {
+            ptr++;
+        }
         
-        if (*ptr == '\0' || *ptr == '#' || *ptr == '\n') break;
+        // End of line or start of comment
+        if (*ptr == '\0' || *ptr == '\n' || *ptr == '#') {
+            break;
+        }
         
-        // Check for special tokens
+        // Redirection tokens
         if (*ptr == '<') {
+            // Already expecting a filename for a previous redirect: syntax error
+            if (in_redirect != 0) {
+                job->has_syntax_error = 1;
+                return job;
+            }
             in_redirect = 1;
             ptr++;
             continue;
         }
         
         if (*ptr == '>') {
+            // Already expecting a filename for a previous redirect: syntax error
+            if (in_redirect != 0) {
+                job->has_syntax_error = 1;
+                return job;
+            }
             in_redirect = 2;
             ptr++;
             continue;
         }
         
+        // Pipeline separator
         if (*ptr == '|') {
+            // Cannot start a new command while still expecting a redirect target
+            if (in_redirect != 0) {
+                job->has_syntax_error = 1;
+                return job;
+            }
             current_cmd = command_create();
             job->commands[job->num_commands++] = current_cmd;
             ptr++;
-            first_token = 0;
+            first_token = 1; // first token of the new subcommand
             continue;
         }
         
         // Extract token
         char token[MAX_TOKEN_LEN];
         int i = 0;
-        while (*ptr && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' && 
+        while (*ptr && *ptr != ' ' && *ptr != '\t' && *ptr != '\n' &&
                *ptr != '<' && *ptr != '>' && *ptr != '|' && *ptr != '#') {
-            token[i++] = *ptr++;
+            if (i < MAX_TOKEN_LEN - 1) {
+                token[i++] = *ptr;
+            }
+            ptr++;
         }
         token[i] = '\0';
         
-        if (first_token && job->num_commands == 1) {
-            if (strcmp(token, "and") == 0) {
-                job->is_conditional = 1;
-                first_token = 0;
-                continue;
-            }
-            if (strcmp(token, "or") == 0) {
-                job->is_conditional = 2;
-                first_token = 0;
-                continue;
-            }
+        if (token[0] == '\0') {
+            continue;
         }
+        
+        // Conditionals: 'and' / 'or'
+        if (strcmp(token, "and") == 0 || strcmp(token, "or") == 0) {
+            // Use of and/or after a '|' is invalid (anywhere in a later subcommand)
+            if (job->num_commands > 1) {
+                job->has_syntax_error = 1;
+                return job;
+            }
+            // Only treat as a conditional when it is the first token of the command
+            if (first_token && job->num_commands == 1) {
+                job->is_conditional = (strcmp(token, "and") == 0) ? 1 : 2;
+                first_token = 0;
+                continue;
+            }
+            // Otherwise, fall through and treat as a normal word
+        }
+        
         first_token = 0;
         
+        // The token must be a filename if we're in the middle of a redirect
         if (in_redirect == 1) {
             current_cmd->input_file = strdup(token);
             in_redirect = 0;
@@ -458,8 +501,14 @@ Job* parse_line(char *line) {
         }
     }
     
+    // Reached end-of-line while still expecting a filename for a redirect: syntax error
+    if (in_redirect != 0) {
+        job->has_syntax_error = 1;
+    }
+    
     return job;
 }
+
 
 int main(int argc, char *argv[]) {
     int input_fd = 0;
